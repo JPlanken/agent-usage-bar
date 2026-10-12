@@ -6,3 +6,5 @@ tsconfig.json
 todo.md
 .github/**
 CHANGELOG.md.bak
+tests/**
+tools/**

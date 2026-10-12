@@ -1,8 +1,8 @@
 {
-  "name": "claude-plan-usage",
-  "displayName": "Claude Plan Usage",
-  "description": "Shows Claude plan usage (5-hour session, weekly all models, weekly per-model) in the VS Code status bar.",
-  "version": "0.2.1",
+  "name": "agent-usage",
+  "displayName": "Agent Usage",
+  "description": "Monitor Claude and Codex plan usage for every signed-in profile in the Explorer sidebar and status bar.",
+  "version": "0.6.0",
   "publisher": "planken",
   "license": "MIT",
   "engines": {
@@ -18,41 +18,140 @@
   "contributes": {
     "commands": [
       {
-        "command": "claudeUsageBar.refresh",
+        "command": "agentUsageBar.refresh",
         "title": "Refresh",
-        "category": "Claude Usage",
+        "category": "Agent Usage",
         "icon": "$(refresh)"
       },
       {
-        "command": "claudeUsageBar.openUsagePage",
+        "command": "agentUsageBar.openUsagePage",
         "title": "Open Usage Page",
-        "category": "Claude Usage",
+        "category": "Agent Usage",
         "icon": "$(link-external)"
+      },
+      {
+        "command": "agentUsageBar.openSettings",
+        "title": "Settings",
+        "category": "Agent Usage",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "agentUsageBar.selectProviders",
+        "title": "Select Providers",
+        "category": "Agent Usage",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "agentUsageBar.selectClaudeProfile",
+        "title": "Select Claude Profile",
+        "category": "Agent Usage",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "agentUsageBar.selectCodexHome",
+        "title": "Select Codex Home",
+        "category": "Agent Usage",
+        "icon": "$(folder-opened)"
       }
     ],
     "configuration": {
-      "title": "Claude Usage Bar",
+      "title": "Agent Usage",
       "properties": {
-        "claudeUsageBar.refreshIntervalMinutes": {
+        "agentUsageBar.refreshIntervalMinutes": {
           "type": "number",
           "default": 5,
           "minimum": 1,
           "description": "How often to poll the usage endpoint."
         },
+        "agentUsageBar.warnAtPercent": {
+          "type": "number",
+          "default": 80,
+          "description": "Highlight the status bar item (warning colour) when any limit reaches this percentage.",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "agentUsageBar.errorAtPercent": {
+          "type": "number",
+          "default": 95,
+          "description": "Highlight the status bar item (error colour) when any limit reaches this percentage.",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "agentUsageBar.showStatusBarItem": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also show the compact summary in the status bar."
+        },
+        "agentUsageBar.claude.configDirectory": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Extra Claude config directory to monitor besides the signed-in ~/.claude and ~/.claude-* profiles found automatically (and CLAUDE_CONFIG_DIR when set)."
+        },
+        "agentUsageBar.providers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "claude",
+              "codex"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [
+            "claude",
+            "codex"
+          ],
+          "description": "Providers to monitor. Select one, both, or none."
+        },
+        "agentUsageBar.codex.home": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Extra Codex home directory to monitor besides the signed-in ~/.codex and ~/.codex-* homes found automatically (and CODEX_HOME when set)."
+        },
+        "agentUsageBar.codex.executablePath": {
+          "type": "string",
+          "default": "codex",
+          "scope": "machine",
+          "description": "Codex CLI executable name or absolute path. Used to read account limits through the local app server."
+        },
+        "claudeUsageBar.refreshIntervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "How often to poll the usage endpoint.",
+          "deprecationMessage": "Use agentUsageBar.refreshIntervalMinutes. Existing values remain a fallback until the new setting is configured.",
+          "order": 100
+        },
         "claudeUsageBar.warnAtPercent": {
           "type": "number",
           "default": 80,
-          "description": "Highlight the status bar item (warning colour) when any limit reaches this percentage."
+          "description": "Highlight the status bar item (warning colour) when any limit reaches this percentage.",
+          "deprecationMessage": "Use agentUsageBar.warnAtPercent. Existing values remain a fallback until the new setting is configured.",
+          "order": 100
         },
         "claudeUsageBar.errorAtPercent": {
           "type": "number",
           "default": 95,
-          "description": "Highlight the status bar item (error colour) when any limit reaches this percentage."
+          "description": "Highlight the status bar item (error colour) when any limit reaches this percentage.",
+          "deprecationMessage": "Use agentUsageBar.errorAtPercent. Existing values remain a fallback until the new setting is configured.",
+          "order": 100
         },
         "claudeUsageBar.showStatusBarItem": {
           "type": "boolean",
           "default": true,
-          "description": "Also show the compact summary in the status bar."
+          "description": "Also show the compact summary in the status bar.",
+          "deprecationMessage": "Use agentUsageBar.showStatusBarItem. Existing values remain a fallback until the new setting is configured.",
+          "order": 100
+        },
+        "claudeUsageBar.configDirectory": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "Claude config directory to monitor, such as ~/.claude-personal. Empty uses CLAUDE_CONFIG_DIR when set, otherwise ~/.claude. Selects matching profile credentials on macOS too.",
+          "deprecationMessage": "Use agentUsageBar.claude.configDirectory. Existing values remain a fallback until the new setting is configured.",
+          "order": 100
         }
       }
     },
@@ -61,43 +160,86 @@
         {
           "type": "webview",
           "id": "claudeUsageBar.view",
-          "name": "Claude Usage",
-          "icon": "$(pulse)",
-          "contextualTitle": "Claude Usage"
+          "name": "Agent Usage",
+          "icon": "$(dashboard)",
+          "contextualTitle": "Agent Usage"
         }
       ]
     },
     "menus": {
       "view/title": [
         {
-          "command": "claudeUsageBar.refresh",
+          "command": "agentUsageBar.refresh",
           "when": "view == claudeUsageBar.view",
           "group": "navigation@1"
         },
         {
-          "command": "claudeUsageBar.openUsagePage",
+          "command": "agentUsageBar.openUsagePage",
           "when": "view == claudeUsageBar.view",
           "group": "navigation@2"
+        },
+        {
+          "command": "agentUsageBar.openSettings",
+          "when": "view == claudeUsageBar.view",
+          "group": "navigation@3"
         }
       ]
-    }
+    },
+    "icons": {
+      "claude-usage-logo": {
+        "description": "Claude logo for plan usage",
+        "default": {
+          "fontPath": "./resources/usage-icons.woff",
+          "fontCharacter": "\\E001"
+        }
+      },
+      "codex-usage-logo": {
+        "description": "Codex logo for plan usage",
+        "default": {
+          "fontPath": "./resources/usage-icons.woff",
+          "fontCharacter": "\\E002"
+        }
+      }
+    },
+    "colors": [
+      {
+        "id": "agentUsage.claude",
+        "description": "Claude usage accent.",
+        "defaults": {
+          "dark": "#D97757",
+          "light": "#A84B31",
+          "highContrast": "#F4AD91",
+          "highContrastLight": "#8F341C"
+        }
+      },
+      {
+        "id": "agentUsage.codex",
+        "description": "Codex usage accent.",
+        "defaults": {
+          "dark": "#A8D5BA",
+          "light": "#27704F",
+          "highContrast": "#BDF5D5",
+          "highContrastLight": "#155734"
+        }
+      }
+    ]
   },
   "icon": "icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/JPlanken/claude-usage-bar.git"
+    "url": "https://github.com/JPlanken/agent-usage-bar.git"
   },
   "bugs": {
-    "url": "https://github.com/JPlanken/claude-usage-bar/issues"
+    "url": "https://github.com/JPlanken/agent-usage-bar/issues"
   },
-  "homepage": "https://github.com/JPlanken/claude-usage-bar#readme",
+  "homepage": "https://github.com/JPlanken/agent-usage-bar#readme",
   "keywords": [
     "claude",
-    "claude code",
-    "anthropic",
+    "codex",
     "usage",
-    "rate limit",
-    "status bar"
+    "plan limits",
+    "status bar",
+    "profiles"
   ],
   "galleryBanner": {
     "color": "#1e1e24",
@@ -106,9 +248,10 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npm run compile && vsce package --no-dependencies -o claude-plan-usage.vsix",
-    "install-local": "npm run package && code --install-extension claude-plan-usage.vsix --force",
-    "install-vscode": "npm run package && \"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code\" --install-extension claude-plan-usage.vsix --force"
+    "package": "npm run compile && vsce package --no-dependencies -o agent-usage.vsix",
+    "install-local": "npm run package && code --install-extension agent-usage.vsix --force",
+    "install-vscode": "npm run package && \"/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code\" --install-extension agent-usage.vsix --force",
+    "test": "npm run compile && node --test tests/*.test.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

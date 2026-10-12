@@ -1,377 +1,254 @@
-import * as vscode from "vscode";
-import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
 import * as os from "node:os";
-import * as path from "node:path";
-import { promisify } from "node:util";
+import * as vscode from "vscode";
+import { detectClaudeVersion, fetchClaudeUsage } from "./claude";
+import { codexHome, fetchCodexUsage } from "./codex";
+import { UsageMonitor } from "./monitor";
+import { discoverAccounts } from "./profiles";
+import { Account, ProviderId } from "./usage";
 
-const execFileAsync = promisify(execFile);
-
-const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const USAGE_PAGE = "https://claude.ai/settings/usage";
-const KEYCHAIN_SERVICE = "Claude Code-credentials";
-const DEFAULT_UA = "claude-code/2.1.266";
-
-interface Limit {
-  kind: "session" | "weekly_all" | "weekly_scoped" | string;
-  percent: number;
-  resets_at: string | null;
-  is_active?: boolean;
-  scope?: { model?: { display_name?: string | null } | null } | null;
-}
-
-interface UsageResponse {
-  limits?: Limit[];
-  five_hour?: { utilization: number; resets_at: string | null } | null;
-  seven_day?: { utilization: number; resets_at: string | null } | null;
-}
-
-interface Row {
-  label: string;
-  percent: number;
-  resetsAt: Date | null;
-  active: boolean;
-}
-
-let statusItem: vscode.StatusBarItem;
+const IDS: ProviderId[] = ["claude", "codex"];
+const NAMES = { claude: "Claude", codex: "Codex" };
+const ICONS = { claude: "claude-usage-logo", codex: "codex-usage-logo" };
+const PAGES = { claude: "https://claude.ai/settings/usage", codex: "https://chatgpt.com/codex/settings/usage" };
+const LEGACY: Record<string, string> = {
+  "claude.configDirectory": "configDirectory", refreshIntervalMinutes: "refreshIntervalMinutes",
+  warnAtPercent: "warnAtPercent", errorAtPercent: "errorAtPercent", showStatusBarItem: "showStatusBarItem",
+};
+// Discovered accounts in display order; monitors and status items are keyed by `key(account)`.
+let accounts: Account[] = [];
+const monitors = new Map<string, UsageMonitor>();
+const items = new Map<string, vscode.StatusBarItem>();
+let discovering: Promise<void> | undefined;
+let discoveryError: string | undefined;
 let timer: NodeJS.Timeout | undefined;
-let lastRows: Row[] = [];
-let lastError: string | undefined;
-let lastUpdated: Date | undefined;
-let viewProvider: UsageViewProvider | undefined;
-let userAgent = DEFAULT_UA;
-let backoffUntil = 0;
+let provider: UsageViewProvider | undefined;
 
-// --- Credentials -----------------------------------------------------------
-
-async function readToken(): Promise<string> {
-  const parse = (raw: string): string => {
-    const json = JSON.parse(raw);
-    const token = json?.claudeAiOauth?.accessToken;
-    if (typeof token !== "string" || !token) {
-      throw new Error("No claudeAiOauth.accessToken in credentials");
-    }
-    return token;
-  };
-
-  if (process.platform === "darwin") {
-    try {
-      const { stdout } = await execFileAsync("security", [
-        "find-generic-password",
-        "-s",
-        KEYCHAIN_SERVICE,
-        "-w",
-      ]);
-      return parse(stdout.trim());
-    } catch {
-      // fall through to file
-    }
+export function setting<T>(key: string, fallback: T): T {
+  const cfg = vscode.workspace.getConfiguration("agentUsageBar");
+  const entry = cfg.inspect<T>(key);
+  if (entry?.globalValue !== undefined || entry?.workspaceValue !== undefined || entry?.workspaceFolderValue !== undefined) {
+    return cfg.get<T>(key, fallback);
   }
-  const file = path.join(os.homedir(), ".claude", ".credentials.json");
-  return parse(await fs.readFile(file, "utf8"));
+  const old = LEGACY[key];
+  return old ? vscode.workspace.getConfiguration("claudeUsageBar").get<T>(old, cfg.get<T>(key, fallback)) : cfg.get<T>(key, fallback);
 }
-
-async function detectUserAgent(): Promise<void> {
-  try {
-    const { stdout } = await execFileAsync("claude", ["--version"]);
-    const version = stdout.trim().split(/\s+/)[0];
-    if (/^\d+\.\d+\.\d+/.test(version)) {
-      userAgent = `claude-code/${version}`;
-    }
-  } catch {
-    // keep default
-  }
+function enabled(): ProviderId[] {
+  const selected = setting<string[]>("providers", IDS);
+  return IDS.filter(id => selected.includes(id));
 }
-
-// --- Fetch -----------------------------------------------------------------
-
-async function fetchUsage(): Promise<Row[]> {
-  const token = await readToken();
-  const res = await fetch(USAGE_URL, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "anthropic-beta": "oauth-2025-04-20",
-      "User-Agent": userAgent,
-      Accept: "application/json",
-    },
+const key = (account: Account) => `${account.provider}:${account.directory}`;
+const shortPath = (directory: string) => directory.startsWith(os.homedir()) ? "~" + directory.slice(os.homedir().length) : directory;
+function profiles(id: ProviderId): string {
+  const found = accounts.filter(account => account.provider === id).map(account => shortPath(account.directory));
+  return found.join(", ") || "None signed in";
+}
+async function selectDirectory(id: ProviderId): Promise<void> {
+  const folders = await vscode.window.showOpenDialog({
+    canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
+    openLabel: "Monitor this profile", title: id === "claude" ? "Add a Claude config directory" : "Add a Codex home directory",
   });
-  if (res.status === 401) {
-    throw new Error("Unauthorized (run `claude` to refresh login)");
-  }
-  if (res.status === 429) {
-    backoffUntil = Date.now() + 15 * 60 * 1000;
-    throw new Error("Rate limited by usage endpoint, backing off 15 min");
-  }
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  const data = (await res.json()) as UsageResponse;
-  return toRows(data);
-}
-
-function toRows(data: UsageResponse): Row[] {
-  const rows: Row[] = [];
-  const limits = data.limits ?? [];
-  const parseDate = (s: string | null | undefined) => (s ? new Date(s) : null);
-
-  if (limits.length > 0) {
-    for (const l of limits) {
-      let label: string;
-      if (l.kind === "session") {
-        label = "5h";
-      } else if (l.kind === "weekly_all") {
-        label = "wk";
-      } else if (l.kind === "weekly_scoped") {
-        label = l.scope?.model?.display_name ?? "model";
-      } else {
-        label = l.kind;
-      }
-      rows.push({
-        label,
-        percent: Math.round(l.percent),
-        resetsAt: parseDate(l.resets_at),
-        active: Boolean(l.is_active),
-      });
-    }
-    return rows;
-  }
-
-  // Fallback for older response shapes without `limits`.
-  if (data.five_hour) {
-    rows.push({
-      label: "5h",
-      percent: Math.round(data.five_hour.utilization),
-      resetsAt: parseDate(data.five_hour.resets_at),
-      active: false,
-    });
-  }
-  if (data.seven_day) {
-    rows.push({
-      label: "wk",
-      percent: Math.round(data.seven_day.utilization),
-      resetsAt: parseDate(data.seven_day.resets_at),
-      active: false,
-    });
-  }
-  return rows;
-}
-
-// --- Rendering -------------------------------------------------------------
-
-function relative(d: Date | null): string {
-  if (!d) {
-    return "n/a";
-  }
-  const ms = d.getTime() - Date.now();
-  if (ms <= 0) {
-    return "now";
-  }
-  const mins = Math.round(ms / 60000);
-  if (mins < 60) {
-    return `${mins}m`;
-  }
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) {
-    return `${hours}h ${mins % 60}m`;
-  }
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h`;
-}
-
-function thresholds(): { warnAt: number; errorAt: number } {
-  const cfg = vscode.workspace.getConfiguration("claudeUsageBar");
-  return {
-    warnAt: cfg.get<number>("warnAtPercent", 80),
-    errorAt: cfg.get<number>("errorAtPercent", 95),
-  };
-}
-
-function applyStatusBarVisibility(): void {
-  const show = vscode.workspace.getConfiguration("claudeUsageBar").get<boolean>("showStatusBarItem", true);
-  if (show) {
-    statusItem.show();
-  } else {
-    statusItem.hide();
-  }
-}
-
-function render(rows: Row[]): void {
-  lastRows = rows;
-  lastError = undefined;
-  lastUpdated = new Date();
-  viewProvider?.update();
-  const { warnAt, errorAt } = thresholds();
-
-  const text = rows.map((r) => `${r.label} ${r.percent}%`).join(" · ");
-  statusItem.text = `$(pulse) ${text}`;
-
-  const max = Math.max(0, ...rows.map((r) => r.percent));
-  if (max >= errorAt) {
-    statusItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
-  } else if (max >= warnAt) {
-    statusItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
-  } else {
-    statusItem.backgroundColor = undefined;
-  }
-
-  const md = new vscode.MarkdownString(undefined, true);
-  md.appendMarkdown("**Claude plan usage**\n\n");
-  md.appendMarkdown("| Limit | Used | Resets in | Resets at |\n|---|---|---|---|\n");
-  for (const r of rows) {
-    const name = r.active ? `**${r.label}** (binding)` : r.label;
-    const at = r.resetsAt ? r.resetsAt.toLocaleString() : "n/a";
-    md.appendMarkdown(`| ${name} | ${r.percent}% | ${relative(r.resetsAt)} | ${at} |\n`);
-  }
-  md.appendMarkdown(`\n_Updated ${new Date().toLocaleTimeString()}. Click to open the usage page._`);
-  statusItem.tooltip = md;
-}
-
-function renderError(message: string): void {
-  lastError = message;
-  viewProvider?.update();
-  statusItem.text = "$(warning) Claude usage";
-  statusItem.backgroundColor = undefined;
-  statusItem.tooltip = `Claude usage unavailable: ${message}\nClick to open the usage page.`;
-}
-
-// --- Explorer view ---------------------------------------------------------
-
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (ch) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] as string
+  if (folders?.[0]) await vscode.workspace.getConfiguration("agentUsageBar").update(
+    id === "claude" ? "claude.configDirectory" : "codex.home", folders[0].fsPath, vscode.ConfigurationTarget.Global,
   );
 }
-
+async function selectProviders(): Promise<void> {
+  const selected = enabled();
+  const result = await vscode.window.showQuickPick(IDS.map(id => ({ label: NAMES[id], id, picked: selected.includes(id) })), {
+    title: "Providers to monitor", canPickMany: true, placeHolder: "Select Claude, Codex, or both",
+  });
+  if (result) await vscode.workspace.getConfiguration("agentUsageBar").update("providers", result.map(item => item.id), vscode.ConfigurationTarget.Global);
+}
+async function openSettings(): Promise<void> {
+  const visible = setting("showStatusBarItem", true);
+  const choice = await vscode.window.showQuickPick([
+    { label: "$(list-selection) Providers to monitor", description: enabled().map(id => NAMES[id]).join(" + ") || "None", action: "providers" },
+    { label: `$(eye${visible ? "-closed" : ""}) ${visible ? "Hide" : "Show"} status bar usage`, description: "Bottom-right summaries", action: "toggle" },
+    { label: "$(folder-opened) Claude profiles", description: profiles("claude"), detail: "Signed-in ~/.claude* directories are found automatically. Pick a folder to add one elsewhere.", action: "claude" },
+    { label: "$(folder-opened) Codex homes", description: profiles("codex"), detail: "Signed-in ~/.codex* directories are found automatically. Pick a folder to add one elsewhere.", action: "codex" },
+    { label: "$(settings-gear) All usage settings", description: "Refresh interval, thresholds, and CLI path", action: "settings" },
+  ], { title: "Agent Usage Settings", placeHolder: "Configure usage monitoring" });
+  switch (choice?.action) {
+    case "providers": await selectProviders(); break;
+    case "toggle": await vscode.workspace.getConfiguration("agentUsageBar").update("showStatusBarItem", !visible, vscode.ConfigurationTarget.Global); break;
+    case "claude": case "codex": await selectDirectory(choice.action); break;
+    case "settings": await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:planken.agent-usage"); break;
+  }
+}
+async function openPage(id?: ProviderId): Promise<void> {
+  const selected = enabled();
+  if (!id) {
+    if (selected.length === 1) id = selected[0];
+    else id = (await vscode.window.showQuickPick(IDS.map(value => ({ label: NAMES[value], id: value })), { title: "Open usage page" }))?.id;
+  }
+  if (id) await vscode.env.openExternal(vscode.Uri.parse(PAGES[id]));
+}
+function relative(date: Date | null): string {
+  if (!date) return "n/a";
+  const minutes = Math.round((date.getTime() - Date.now()) / 60000);
+  if (minutes <= 0) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 24 ? `${hours}h ${minutes % 60}m` : `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+const clock = (date: Date) => date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+function render(): void {
+  for (const account of accounts) {
+    const item = items.get(key(account)), state = monitors.get(key(account))?.state, id = account.provider;
+    if (!item || !state) continue;
+    if (setting("showStatusBarItem", true)) item.show(); else item.hide();
+    const rows = state.snapshot?.rows ?? [];
+    const summary = rows.map(row => `${row.shortLabel} ${row.percent}%`).join(" · ");
+    const prefix = state.error ? "warning" : !state.snapshot && state.loading ? "sync~spin" : ICONS[id];
+    const tag = [id === "codex" ? "Codex" : "", account.name].filter(Boolean).join(" ");
+    item.text = `$(${prefix}) ${[tag, summary].filter(Boolean).join(" ") || NAMES[id]}`;
+    const max = Math.max(0, ...rows.map(row => row.percent));
+    item.backgroundColor = state.error ? undefined : max >= setting("errorAtPercent", 95)
+      ? new vscode.ThemeColor("statusBarItem.errorBackground") : max >= setting("warnAtPercent", 80)
+        ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
+    item.color = state.error || item.backgroundColor ? undefined : new vscode.ThemeColor(`agentUsage.${id}`);
+    const md = new vscode.MarkdownString();
+    md.appendMarkdown(`**${NAMES[id]} usage**\n\n`);
+    md.appendText(`Profile: ${shortPath(account.directory)}\n`);
+    if (state.snapshot?.account) md.appendText(`Account: ${state.snapshot.account}\n`);
+    md.appendText("\n");
+    for (const row of rows) md.appendText(`${row.label}: ${row.percent}% · resets in ${relative(row.resetsAt)}\n`);
+    if (state.snapshot?.note) md.appendText(`\n${state.snapshot.note}\n`);
+    if (state.error) md.appendText(`\nRefresh failed: ${state.error}\n`);
+    if (state.updated) md.appendText(`\nUpdated ${state.updated.toLocaleTimeString()}.\n`);
+    md.appendText("Click to open the usage page. Your browser account may differ.");
+    item.tooltip = md;
+  }
+  provider?.update();
+}
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
 class UsageViewProvider implements vscode.WebviewViewProvider {
-  private view: vscode.WebviewView | undefined;
-
-  resolveWebviewView(webviewView: vscode.WebviewView): void {
-    this.view = webviewView;
-    webviewView.webview.options = { enableScripts: false };
-    webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        void refresh();
-      }
-    });
+  private view?: vscode.WebviewView;
+  resolveWebviewView(view: vscode.WebviewView): void {
+    this.view = view;
+    view.webview.options = { enableScripts: false };
+    view.onDidChangeVisibility(() => { if (view.visible) void refresh(); });
     this.update();
   }
-
   update(): void {
-    if (!this.view) {
-      return;
-    }
-    this.view.webview.html = this.html();
-  }
-
-  private html(): string {
-    const { warnAt, errorAt } = thresholds();
-    const style = `
-      body { padding: 6px 12px 10px; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); }
-      .row { margin: 0 0 12px; }
-      .head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
-      .label { font-weight: 600; }
-      .binding { opacity: 0.7; font-weight: 400; font-size: 0.9em; margin-left: 4px; }
-      .pct { font-variant-numeric: tabular-nums; }
-      .track { height: 6px; border-radius: 3px; background: var(--vscode-progressBar-background, #444); opacity: 0.35; position: relative; }
-      .wrap { position: relative; height: 6px; }
-      .fill { position: absolute; top: 0; left: 0; height: 6px; border-radius: 3px; }
-      .ok { background: var(--vscode-charts-blue, #3794ff); }
-      .warn { background: var(--vscode-charts-yellow, #cca700); }
-      .err { background: var(--vscode-charts-red, #f14c4c); }
-      .meta { opacity: 0.7; font-size: 0.9em; margin-top: 3px; }
-      .foot { opacity: 0.6; font-size: 0.85em; margin-top: 4px; }
-      .error { color: var(--vscode-errorForeground); }
-    `;
+    if (!this.view) return;
     let body = "";
-    if (lastError && lastRows.length === 0) {
-      body = `<p class="error">Usage unavailable: ${escapeHtml(lastError)}</p>`;
-    } else if (lastRows.length === 0) {
-      body = `<p class="meta">Loading…</p>`;
-    } else {
-      for (const r of lastRows) {
-        const cls = r.percent >= errorAt ? "err" : r.percent >= warnAt ? "warn" : "ok";
-        const width = Math.min(100, Math.max(0, r.percent));
-        const name = r.label === "5h" ? "Current session" : r.label === "wk" ? "All models" : r.label;
-        const resets = r.resetsAt
-          ? `Resets in ${relative(r.resetsAt)} (${r.resetsAt.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })})`
-          : "";
-        body += `<div class="row">
-          <div class="head"><span class="label">${escapeHtml(name)}${r.active ? '<span class="binding">binding</span>' : ""}</span><span class="pct">${r.percent}% used</span></div>
-          <div class="wrap"><div class="track"></div><div class="fill ${cls}" style="width:${width}%"></div></div>
-          <div class="meta">${escapeHtml(resets)}</div>
-        </div>`;
+    for (const account of accounts) {
+      const id = account.provider, state = monitors.get(key(account))!.state;
+      const who = state.snapshot?.account ?? shortPath(account.directory);
+      body += `<section><div class="title"><h2 class="${id}-title">${NAMES[id]}</h2><span class="who" title="${escapeHtml(shortPath(account.directory))}">${escapeHtml(who)}</span>`
+        + (state.updated ? `<span class="time" title="Updated ${escapeHtml(state.updated.toLocaleTimeString())}">${escapeHtml(clock(state.updated))}</span>` : "") + "</div>";
+      if (!state.snapshot && !state.error) body += '<p class="meta">Loading…</p>';
+      for (const row of state.snapshot?.rows ?? []) {
+        const color = row.percent >= setting("errorAtPercent", 95) ? "error" : row.percent >= setting("warnAtPercent", 80) ? "warning" : id;
+        const at = row.resetsAt ? row.resetsAt.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : "";
+        const width = Math.min(100, Math.max(0, row.percent));
+        body += `<div class="row"><div class="head"><span class="label">${escapeHtml(row.label)}${row.active ? '<span class="binding">binding</span>' : ""}</span>`
+          + (row.resetsAt ? `<span class="meta" title="Resets ${escapeHtml(at)}">${escapeHtml(relative(row.resetsAt))}</span>` : "")
+          + `<span class="pct">${row.percent}%</span></div>
+          <div class="track" role="progressbar" aria-label="${escapeHtml(row.label)}" aria-valuenow="${width}" aria-valuemin="0" aria-valuemax="100"><div class="fill ${color}" style="width:${width}%"></div></div></div>`;
       }
-      if (lastError) {
-        body += `<p class="error">Last refresh failed: ${escapeHtml(lastError)}</p>`;
-      }
+      if (state.snapshot?.note) body += `<p class="meta">${escapeHtml(state.snapshot.note)}</p>`;
+      else if (state.snapshot && state.snapshot.rows.length === 0) body += '<p class="meta">No usage limits reported.</p>';
+      if (state.error) body += `<p class="error-text">${state.snapshot ? "Refresh failed" : "Usage unavailable"}: ${escapeHtml(state.error)}</p>`;
+      body += "</section>";
     }
-    const updated = lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : "";
-    return `<!DOCTYPE html><html><head><meta charset="UTF-8">
-      <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
-      <style>${style}</style></head><body>${body}<div class="foot">${updated}</div></body></html>`;
+    if (discoveryError) body += `<p class="error-text">${escapeHtml(discoveryError)}</p>`;
+    else if (!enabled().length) body = '<p class="meta">Choose providers from the settings gear to start monitoring.</p>';
+    else if (!accounts.length) body = discovering ? '<p class="meta">Looking for signed-in profiles…</p>'
+      : `<p class="meta">No signed-in ${enabled().map(id => NAMES[id]).join(" or ")} profile found. Sign in with the CLI, or add a directory from the settings gear.</p>`;
+    this.view.webview.html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"><style>
+      body{padding:2px 10px 4px;font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-foreground)}
+      section+section{margin-top:8px;padding-top:6px;border-top:1px solid var(--vscode-widget-border,#444)}
+      .title{display:flex;align-items:baseline;gap:6px;margin:0 0 4px}h2{font-size:11px;letter-spacing:.08em;text-transform:uppercase;margin:0;white-space:nowrap}
+      .who{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.6;font-size:.85em}.time{opacity:.5;font-size:.85em;font-variant-numeric:tabular-nums;white-space:nowrap}
+      .row{margin-bottom:5px}.head{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}.label{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pct{font-variant-numeric:tabular-nums;white-space:nowrap}.binding{opacity:.7;font-weight:400;font-size:.9em;margin-left:5px}
+      .track{height:4px;border-radius:2px;background:var(--vscode-editor-inactiveSelectionBackground,#333);overflow:hidden}.fill{height:100%;border-radius:2px}.claude{background:var(--vscode-agentUsage-claude,#d97757)}.codex{background:var(--vscode-agentUsage-codex,#a8d5ba)}.claude-title{color:var(--vscode-agentUsage-claude,#d97757)}.codex-title{color:var(--vscode-agentUsage-codex,#a8d5ba)}.warning{background:var(--vscode-charts-yellow,#cca700)}.error{background:var(--vscode-charts-red,#f14c4c)}
+      .meta{opacity:.6;font-size:.85em;white-space:nowrap}p.meta{margin:2px 0;white-space:normal}.error-text{color:var(--vscode-errorForeground);overflow-wrap:anywhere;margin:2px 0}
+      </style></head><body>${body}</body></html>`;
   }
 }
-
-// --- Lifecycle -------------------------------------------------------------
-
-async function refresh(): Promise<void> {
-  if (Date.now() < backoffUntil) {
-    return;
+function fetchFor(account: Account, signal: AbortSignal) {
+  return account.provider === "claude"
+    ? fetchClaudeUsage(account.directory, signal)
+    : fetchCodexUsage({ executable: setting("codex.executablePath", "codex"), home: account.directory, signal });
+}
+// Rebuild monitors and status items for the discovered list; monitors survive when their account stays.
+function reconcile(found: Account[]): void {
+  const keys = new Set(found.map(key));
+  for (const [id, monitor] of monitors) if (!keys.has(id)) { monitor.reset(); monitors.delete(id); }
+  for (const account of found) if (!monitors.has(key(account))) monitors.set(key(account), new UsageMonitor(render));
+  if (found.map(key).join("\n") !== accounts.map(key).join("\n")) {
+    for (const item of items.values()) item.dispose();
+    items.clear();
+    found.forEach((account, index) => {
+      const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 10000 + found.length - index);
+      item.name = `${NAMES[account.provider]} Usage${account.name ? ` (${account.name})` : ""}`;
+      item.command = `agentUsageBar.open${account.provider === "claude" ? "Claude" : "Codex"}UsagePage`;
+      items.set(key(account), item);
+    });
   }
+  accounts = found;
+  render();
+}
+async function discover(): Promise<void> {
   try {
-    render(await fetchUsage());
-  } catch (err) {
-    renderError(err instanceof Error ? err.message : String(err));
+    reconcile(await discoverAccounts(enabled(), { claude: setting("claude.configDirectory", ""), codex: setting("codex.home", "") }));
+    discoveryError = undefined;
+  } catch (error) {
+    discoveryError = `Profile discovery failed: ${error instanceof Error ? error.message : String(error)}`;
+    render();
   }
 }
-
+async function refresh(): Promise<void> {
+  discovering ??= discover().finally(() => { discovering = undefined; });
+  await discovering;
+  await Promise.all(accounts.map(account => monitors.get(key(account))!.refresh(signal => fetchFor(account, signal))));
+}
+function clear(): void {
+  for (const monitor of monitors.values()) monitor.reset();
+  monitors.clear();
+  for (const item of items.values()) item.dispose();
+  items.clear();
+  accounts = [];
+}
 function schedule(): void {
-  if (timer) {
-    clearInterval(timer);
-  }
-  const minutes = vscode.workspace
-    .getConfiguration("claudeUsageBar")
-    .get<number>("refreshIntervalMinutes", 5);
-  timer = setInterval(() => void refresh(), Math.max(1, minutes) * 60 * 1000);
+  if (timer) clearInterval(timer);
+  timer = setInterval(() => void refresh(), Math.max(1, setting("refreshIntervalMinutes", 5)) * 60000);
 }
-
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-  statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusItem.name = "Claude Usage";
-  statusItem.command = "claudeUsageBar.openUsagePage";
-  statusItem.text = "$(sync~spin) Claude usage";
-  applyStatusBarVisibility();
-
-  viewProvider = new UsageViewProvider();
-
+  provider = new UsageViewProvider();
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider("claudeUsageBar.view", provider));
+  const actions: Record<string, () => unknown> = {
+    refresh, openSettings, selectProviders, openUsagePage: () => openPage(),
+    selectClaudeProfile: () => selectDirectory("claude"), selectCodexHome: () => selectDirectory("codex"),
+    openClaudeUsagePage: () => openPage("claude"), openCodexUsagePage: () => openPage("codex"),
+  };
+  for (const [name, callback] of Object.entries(actions)) context.subscriptions.push(vscode.commands.registerCommand(`agentUsageBar.${name}`, callback));
+  for (const [old, current] of Object.entries({ refresh: "refresh", openSettings: "openSettings", openUsagePage: "openClaudeUsagePage", selectConfigDirectory: "selectClaudeProfile" })) {
+    context.subscriptions.push(vscode.commands.registerCommand(`claudeUsageBar.${old}`, actions[current]));
+  }
   context.subscriptions.push(
-    statusItem,
-    vscode.window.registerWebviewViewProvider("claudeUsageBar.view", viewProvider),
-    vscode.commands.registerCommand("claudeUsageBar.refresh", () => refresh()),
-    vscode.commands.registerCommand("claudeUsageBar.openUsagePage", () =>
-      vscode.env.openExternal(vscode.Uri.parse(USAGE_PAGE))
-    ),
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("claudeUsageBar")) {
-        applyStatusBarVisibility();
-        schedule();
-        void refresh();
-      }
+    vscode.workspace.onDidChangeConfiguration(event => {
+      if (!event.affectsConfiguration("agentUsageBar") && !event.affectsConfiguration("claudeUsageBar")) return;
+      const rediscover = ["agentUsageBar.providers", "agentUsageBar.claude", "agentUsageBar.codex", "claudeUsageBar.configDirectory"]
+        .some(section => event.affectsConfiguration(section));
+      if (rediscover) clear();
+      render(); schedule();
+      if (rediscover) void refresh();
     }),
-    vscode.window.onDidChangeWindowState((s) => {
-      if (s.focused) {
-        void refresh();
-      }
-    })
+    vscode.window.onDidChangeWindowState(state => { if (state.focused) void refresh(); }),
+    { dispose: deactivate },
   );
-
-  await detectUserAgent();
+  render();
+  // Version detection must not delay Codex's initial refresh.
+  void detectClaudeVersion();
   await refresh();
   schedule();
 }
-
 export function deactivate(): void {
-  if (timer) {
-    clearInterval(timer);
-  }
+  if (timer) clearInterval(timer);
+  timer = undefined;
+  clear();
 }
