@@ -88,6 +88,14 @@
           "scope": "machine",
           "description": "Extra Claude config directory to monitor besides the signed-in ~/.claude and ~/.claude-* profiles found automatically (and CLAUDE_CONFIG_DIR when set)."
         },
+        "agentUsageBar.profileNames": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "markdownDescription": "Names for profiles, shown in the status bar and sidebar. Keys are a profile directory (`~/.claude-personal`), an account email (`me@example.com`) or an email domain (`@example.com`); a directory key wins over an email, an email over a domain. Without a name the directory suffix is shown. Set one from the settings gear: **Profile names**."
+        },
         "agentUsageBar.providers": {
           "type": "array",
           "items": {

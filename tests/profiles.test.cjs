@@ -36,3 +36,13 @@ test('disabled providers are skipped and names derive from the directory suffix'
  assert.deepEqual((await discoverAccounts(['codex'],{claude:'',codex:''},source())).map(a=>a.provider),['codex']);
  assert.equal(profileName('claude','/x/.claude-work'),'work');assert.equal(profileName('codex','/x/.codex'),'');assert.equal(profileName('claude','/x/other'),'other');
 });
+test('profile names come from a directory key, then the account email, then the email domain',async()=>{
+ const {displayName}=require('../out/profiles');
+ const work={provider:'claude',directory:home+'/.claude',name:''},pers={provider:'claude',directory:home+'/.claude-personal',name:'personal'};
+ const names={'@corp.example':'Client','me@mail.example':'My Company','~/.claude-personal/':'Personal dir'};
+ assert.equal(displayName(work,'Someone@Corp.example',names,home),'Client');
+ assert.equal(displayName(pers,'me@mail.example',names,home),'Personal dir');
+ assert.equal(displayName(pers,'me@mail.example',{'me@mail.example':'My Company','@mail.example':'Other'},home),'My Company');
+ assert.equal(displayName(pers,undefined,{},home),'personal');
+ assert.equal(displayName(work,'x@y.example',{'@y.example':'  ',bad:3},home),'');
+});

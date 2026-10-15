@@ -27,6 +27,22 @@ export function profileName(provider: ProviderId, directory: string): string {
   const base = path.basename(directory), prefix = PREFIX[provider];
   return base === prefix ? "" : base.startsWith(prefix + "-") ? base.slice(prefix.length + 1) : base;
 }
+// The name shown for a profile. `names` comes from the agentUsageBar.profileNames setting; a key is a profile
+// directory (~ allowed), an account email, or @domain. A directory key wins over the email, the email over the domain;
+// without a match the name is the directory suffix ("" for the provider default).
+export function displayName(account: Account, email: string | undefined, names: Record<string, unknown>, home = source.home): string {
+  const entries = Object.entries(names ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim() !== "");
+  const dir = (value: string) => path.normalize(value.startsWith("~") ? path.join(home, value.slice(1)) : value).replace(/\/+$/, "");
+  const byDir = entries.find(([k]) => !k.includes("@") && dir(k) === dir(account.directory));
+  if (byDir) return byDir[1].trim();
+  const mail = email?.trim().toLowerCase();
+  if (mail) {
+    const domain = "@" + mail.split("@").pop();
+    const hit = entries.find(([k]) => k.toLowerCase() === mail) ?? entries.find(([k]) => k.toLowerCase() === domain);
+    if (hit) return hit[1].trim();
+  }
+  return account.name;
+}
 // ~/<prefix>, every ~/<prefix>-* directory, the environment directory, then the configured extra. First seen wins.
 async function candidates(provider: ProviderId, extras: string[], s: ProfileSource): Promise<string[]> {
   const prefix = PREFIX[provider];

@@ -2,6 +2,7 @@
 
 ## 0.6.0
 
+- `agentUsageBar.profileNames`: name each profile by directory, account email or `@domain`; the name leads its status item (`Client: 5h 97% · wk 51%`) and section header. Set from the settings gear, **Profile names**
 - Show every signed-in Claude profile (`~/.claude`, `~/.claude-*`) and Codex home (`~/.codex`, `~/.codex-*`) at once, each with its own section and status item
 - Header shows the account email and last update time; reset times sit on the limit line, so each section takes about half the height
 - `claude.configDirectory` and `codex.home` now add a directory outside the discovered ones

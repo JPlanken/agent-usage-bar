@@ -74,6 +74,20 @@ Codex must support `account/rateLimits/read`; verified with CLI 0.154.0. API-key
 
 Protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server).
 
+### Profile names
+
+Each profile can carry a name, such as a client or your own company, so two status items with similar limits are easy to tell apart (`TheFork: 5h 97% · wk 51%` next to `My Company: 5h 9%`). Set it from the settings gear (**Profile names**), which stores the profile directory, or write keys that hold on every machine: an account email or an email domain.
+
+```json
+"agentUsageBar.profileNames": {
+  "@client.example": "Client",
+  "me@mycompany.example": "My Company",
+  "~/.claude-personal": "Personal"
+}
+```
+
+A directory key wins over an email, an email over a domain. Without a name, the directory suffix is shown (`personal` for `~/.claude-personal`, nothing for `~/.claude`).
+
 ## Settings
 
 | Setting | Default | Purpose |
@@ -83,6 +97,7 @@ Protocol reference: [Codex App Server](https://learn.chatgpt.com/docs/app-server
 | `agentUsageBar.refreshIntervalMinutes` | `5` | Poll interval; minimum one minute |
 | `agentUsageBar.warnAtPercent` | `80` | Warning threshold |
 | `agentUsageBar.errorAtPercent` | `95` | Error threshold |
+| `agentUsageBar.profileNames` | `{}` | Profile names by directory, account email or `@domain` |
 | `agentUsageBar.claude.configDirectory` | empty | Extra Claude profile outside `~/.claude*`; machine-specific |
 | `agentUsageBar.codex.home` | empty | Extra Codex home outside `~/.codex*`; machine-specific |
 | `agentUsageBar.codex.executablePath` | `codex` | CLI executable; machine-specific |

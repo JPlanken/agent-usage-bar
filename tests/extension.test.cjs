@@ -6,7 +6,7 @@ const path=require('node:path');
 const flush=()=>new Promise(resolve=>setImmediate(resolve));
 test('combined UI preserves old settings, lists every signed-in profile, and configures providers without unnecessary requests',async()=>{
  const values={'claudeUsageBar':{configDirectory:'~/.claude-personal',showStatusBarItem:false},agentUsageBar:{}};
- const commands={},items=[],calls={claude:0,codex:0},profiles=[];let changed,action='toggle',selected=['codex'],html,discoveries=0;
+ const commands={},items=[],calls={claude:0,codex:0},profiles=[];let inputValue,changed,action='toggle',selected=['codex'],html,discoveries=0;
  const live=()=>items.filter(i=>!i.disposed);
  const config=namespace=>({
   get:(key,fallback)=>values[namespace][key]??fallback,
@@ -19,7 +19,8 @@ test('combined UI preserves old settings, lists every signed-in profile, and con
    createStatusBarItem:()=>{const item={show(){this.visible=true},hide(){this.visible=false},dispose(){this.disposed=true}};items.push(item);return item},
    registerWebviewViewProvider:(_id,p)=>{const webview={options:{},set html(value){html=value},get html(){return html}};p.resolveWebviewView({webview,onDidChangeVisibility(){}})},
    onDidChangeWindowState(){},
-   showQuickPick:async(choices,opts)=>opts.canPickMany?choices.filter(c=>selected.includes(c.id)):choices.find(c=>c.action===action),
+   showQuickPick:async(choices,opts)=>opts.canPickMany?choices.filter(c=>selected.includes(c.id)):choices.find(c=>c.action===action)??choices.find(c=>c.account),
+   showInputBox:async()=>inputValue,
   },
   commands:{registerCommand:(id,cb)=>commands[id]=cb,executeCommand:async(...args)=>assert.deepEqual(args,['workbench.action.openSettings','@ext:planken.agent-usage'])},
   StatusBarAlignment:{Right:1},ConfigurationTarget:{Global:1},ThemeColor:class{},MarkdownString:class{appendMarkdown(){}appendText(){}},
@@ -35,7 +36,7 @@ test('combined UI preserves old settings, lists every signed-in profile, and con
   exports,require:name=>name==='vscode'?vscode
    :name==='./claude'?{detectClaudeVersion:async()=>{},fetchClaudeUsage:async directory=>{calls.claude++;profiles.push(directory);return snapshot('All models',directory==='/test/.claude'?'work@example.com':undefined)}}
    :name==='./codex'?{codexHome:()=>'/test/.codex',fetchCodexUsage:async()=>{calls.codex++;return snapshot('Weekly','codex@example.com')}}
-   :name==='./profiles'?{discoverAccounts}:name.startsWith('node:')?require(name)
+   :name==='./profiles'?{discoverAccounts,displayName:require('../out/profiles').displayName}:name.startsWith('node:')?require(name)
    :require(path.resolve(__dirname,'../out',name)),
   setInterval:()=>1,clearInterval(){},console,
  });
@@ -45,7 +46,15 @@ test('combined UI preserves old settings, lists every signed-in profile, and con
  assert.equal((html.match(/<h2 class="claude-title">Claude<\/h2>/g)||[]).length,2);assert.match(html,/<h2 class="codex-title">Codex<\/h2>/);
  assert.match(html,/work@example.com/);assert.match(html,/~\/.claude-personal/);assert.match(html,/codex@example.com/);
  assert(!html.includes('Profile:'));assert(!html.includes('Resets in'));assert.equal((html.match(/class="time"/g)||[]).length,3);
- assert.equal(live()[1].text.startsWith('$(claude-usage-logo) personal wk 23%'),true);assert.equal(live()[2].text,'$(codex-usage-logo) Codex wk 23%');
+ assert.equal(live()[1].text.startsWith('$(claude-usage-logo) personal: wk 23%'),true);assert.equal(live()[2].text,'$(codex-usage-logo) Codex: wk 23%');
+ // Names from agentUsageBar.profileNames: by email domain and by directory; the settings gear writes a directory key.
+ await config('agentUsageBar').update('profileNames',{'@example.com':'Client','~/.claude-personal':'My Company'});
+ assert.equal(live()[0].text,'$(claude-usage-logo) Client: wk 23%');assert.equal(live()[1].text,'$(claude-usage-logo) My Company: wk 23%');
+ assert.equal(live()[2].text,'$(codex-usage-logo) Codex Client: wk 23%');assert.equal(live()[0].name,'Claude Usage (Client)');
+ assert.match(html,/<span class="name">Client<\/span>/);
+ action='names';inputValue='Renamed';await commands['agentUsageBar.openSettings']();
+ assert.equal(values.agentUsageBar.profileNames['/test/.claude'],'Renamed');assert.equal(live()[0].text,'$(claude-usage-logo) Renamed: wk 23%');
+ action='toggle';
  if(process.env.USAGE_PREVIEW_HTML)fs.writeFileSync(process.env.USAGE_PREVIEW_HTML,html);
  assert(commands['claudeUsageBar.refresh']);
  const before=html;await commands['agentUsageBar.openSettings']();
